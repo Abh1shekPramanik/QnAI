@@ -35,7 +35,7 @@ QnAI is a real-time classroom companion that helps professors stay in sync with 
 ```bash
 # Clone the repo
 git clone https://github.com/Abh1shekPramanik/QnAI.git
-cd HuhHub
+cd QnAI
 
 # Install dependencies
 npm install
@@ -51,5 +51,5 @@ npm run dev
 
 ## Team
 
-Built at **Frontiers Hackathon** in 6 hours.git 
+Built at **Frontiers Hackathon**
 
