@@ -2,7 +2,7 @@
 
 > No student left behind.
 
-QnAI is a real-time classroom companion that helps professors stay in sync with their students. Students can anonymously flag confusion and get instant AI-powered help, while professors see a clean, compressed signal of where the class is struggling — without being flooded with raw queries.
+HuhHub is a real-time classroom companion that helps professors stay in sync with their students. Students can anonymously flag confusion and get instant AI-powered help, while professors see a clean, compressed signal of where the class is struggling — without being flooded with raw queries.
 
 ---
 
