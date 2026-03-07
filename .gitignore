@@ -4,7 +4,7 @@ backend/.venv
 __pycache__/
 *.pyc
 venv/
-.venv
+.venv/
 
 .DS_Store
 backend/service-account.json
