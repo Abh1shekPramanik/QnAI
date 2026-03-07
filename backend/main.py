@@ -52,7 +52,7 @@ async def join_meeting(meeting_url: str):
     # Correct Recall v1 Nested Schema
     payload = {
         "meeting_url": meeting_url,
-        "bot_name": "QnAI Transcript Bot",
+        "bot_name": "Q&AI Bot",
         "recording_config": {
             "transcript": {
                 "provider": {
