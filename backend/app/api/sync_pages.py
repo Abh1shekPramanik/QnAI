@@ -1,40 +1,41 @@
 """
 QnAI — Shared Session State Backend (Issue #3)
-Flask + Flask-SocketIO server that keeps teacher-set topic and transcript
+FastAPI + WebSocket server that keeps teacher-set topic and transcript
 synchronised across all connected teacher / student clients in real time.
 
-Now backed by SQLite (db.py) to support multiple professors, students,
-and concurrent sessions.
+Backed by SQLite (db.py) for multiple professors, students, and sessions.
 
-Socket events are scoped to a session via SocketIO rooms.
-Clients join a room by emitting  join_session { session_id, user_id }
+Real-time sync uses native WebSocket rooms (implemented as dicts of
+connection sets keyed by session_id). Clients connect to /ws/{session_id}
+and receive JSON messages for state updates.
+
+Run with:
+    uvicorn sync_pages:app --port 5001 --reload
 """
 
 from __future__ import annotations
 
 import os
+import json
 from datetime import datetime, timezone
+from typing import Optional
 
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 import db
 
 # ──────────────────────────────────────────────
-# App & extensions
+# App
 # ──────────────────────────────────────────────
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "qnai-dev-secret")
+app = FastAPI(title="QnAI Session Server")
 
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    async_mode="threading",
-    logger=False,
-    engineio_logger=False,
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -43,7 +44,6 @@ def _now_iso() -> str:
 
 
 def _session_snapshot(session_id: str) -> dict | None:
-    """Build a full snapshot for a session from the DB."""
     s = db.get_session(session_id)
     if not s:
         return None
@@ -63,221 +63,286 @@ def _session_snapshot(session_id: str) -> dict | None:
 
 
 # ──────────────────────────────────────────────
+# WebSocket room manager
+# ──────────────────────────────────────────────
+class RoomManager:
+    """Manages WebSocket connections grouped by session_id (room)."""
+
+    def __init__(self):
+        # session_id → set of WebSocket connections
+        self.rooms: dict[str, set[WebSocket]] = {}
+        # All connections (for global broadcasts)
+        self.all_connections: set[WebSocket] = set()
+
+    async def connect(self, ws: WebSocket, session_id: str):
+        await ws.accept()
+        self.all_connections.add(ws)
+        if session_id not in self.rooms:
+            self.rooms[session_id] = set()
+        self.rooms[session_id].add(ws)
+
+    def disconnect(self, ws: WebSocket, session_id: str):
+        self.all_connections.discard(ws)
+        if session_id in self.rooms:
+            self.rooms[session_id].discard(ws)
+            if not self.rooms[session_id]:
+                del self.rooms[session_id]
+
+    async def send_to_room(self, session_id: str, message: dict):
+        """Send a JSON message to all connections in a room."""
+        data = json.dumps(message)
+        dead = []
+        for ws in self.rooms.get(session_id, set()):
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.rooms.get(session_id, set()).discard(ws)
+            self.all_connections.discard(ws)
+
+    async def broadcast(self, message: dict):
+        """Send a JSON message to ALL connected clients."""
+        data = json.dumps(message)
+        dead = []
+        for ws in self.all_connections:
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.all_connections.discard(ws)
+
+
+manager = RoomManager()
+
+
+# Helper: broadcast to room + globally (for backward compat)
+async def _emit_to_session(session_id: str, event: str, payload: dict):
+    message = {"event": event, **payload}
+    await manager.send_to_room(session_id, message)
+    await manager.broadcast(message)
+
+
+# ──────────────────────────────────────────────
+# Pydantic models
+# ──────────────────────────────────────────────
+class TopicBody(BaseModel):
+    topic: str = ""
+
+class TranscriptBody(BaseModel):
+    transcript: str = ""
+
+class EscalationBody(BaseModel):
+    tag: str = ""
+    student_id: str = "anonymous"
+    query: str = ""
+
+class RecallTranscriptBody(BaseModel):
+    session_id: str = "session-001"
+    speaker: str = "Unknown"
+    text: str = ""
+    is_final: bool = False
+
+
+# ──────────────────────────────────────────────
 # REST endpoints
 # ──────────────────────────────────────────────
 
-@app.route("/api/users", methods=["GET"])
-def api_list_users():
-    """List all users, optionally filtered by ?role=professor|student."""
-    role = request.args.get("role")
-    return jsonify(db.list_users(role))
+@app.get("/api/users")
+def api_list_users(role: Optional[str] = None):
+    return db.list_users(role)
 
 
-@app.route("/api/users/<user_id>", methods=["GET"])
-def api_get_user(user_id):
+@app.get("/api/users/{user_id}")
+def api_get_user(user_id: str):
     user = db.get_user(user_id)
     if not user:
-        return jsonify({"error": "User not found"}), 404
-    return jsonify(user)
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
 
-@app.route("/api/sessions", methods=["GET"])
-def api_list_sessions():
-    """List sessions. ?professor_id=... to filter by professor."""
-    professor_id = request.args.get("professor_id")
-    return jsonify(db.list_sessions(professor_id))
+@app.get("/api/sessions")
+def api_list_sessions(professor_id: Optional[str] = None):
+    return db.list_sessions(professor_id)
 
 
-@app.route("/api/sessions/<session_id>", methods=["GET"])
-def api_get_session(session_id):
+@app.get("/api/sessions/{session_id}")
+def api_get_session(session_id: str):
     snap = _session_snapshot(session_id)
     if not snap:
-        return jsonify({"error": "Session not found"}), 404
-    return jsonify(snap)
+        raise HTTPException(status_code=404, detail="Session not found")
+    return snap
 
 
-@app.route("/api/sessions/<session_id>/members", methods=["GET"])
-def api_session_members(session_id):
-    return jsonify(db.get_session_members(session_id))
+@app.get("/api/sessions/{session_id}/members")
+def api_session_members(session_id: str):
+    return db.get_session_members(session_id)
 
 
-@app.route("/api/students/<student_id>/sessions", methods=["GET"])
-def api_student_sessions(student_id):
-    return jsonify(db.get_student_sessions(student_id))
+@app.get("/api/students/{student_id}/sessions")
+def api_student_sessions(student_id: str):
+    return db.get_student_sessions(student_id)
 
 
-@app.route("/api/sessions/<session_id>/topic", methods=["POST"])
-def api_set_topic(session_id):
-    data = request.get_json(force=True)
-    topic = data.get("topic", "")
-    db.update_session_topic(session_id, topic)
-    socketio.emit("topic_updated", {"topic": topic}, room=session_id)
-    socketio.emit("session_state", _session_snapshot(session_id), room=session_id)
-    return jsonify({"ok": True, "topic": topic})
+@app.post("/api/sessions/{session_id}/topic")
+async def api_set_topic(session_id: str, body: TopicBody):
+    db.update_session_topic(session_id, body.topic)
+    await _emit_to_session(session_id, "topic_updated", {"topic": body.topic})
+    return {"ok": True, "topic": body.topic}
 
 
-@app.route("/api/sessions/<session_id>/transcript", methods=["POST"])
-def api_set_transcript(session_id):
-    data = request.get_json(force=True)
-    transcript = data.get("transcript", "")
-    db.update_session_transcript(session_id, transcript)
-    socketio.emit("transcript_updated", {"transcript": transcript}, room=session_id)
-    socketio.emit("session_state", _session_snapshot(session_id), room=session_id)
-    return jsonify({"ok": True})
+@app.post("/api/sessions/{session_id}/transcript")
+async def api_set_transcript(session_id: str, body: TranscriptBody):
+    db.update_session_transcript(session_id, body.transcript)
+    await _emit_to_session(session_id, "transcript_updated", {"transcript": body.transcript})
+    return {"ok": True}
 
 
-@app.route("/api/sessions/<session_id>/escalation", methods=["POST"])
-def api_add_escalation(session_id):
-    data = request.get_json(force=True)
-    tag = data.get("tag", "")
-    student_id = data.get("student_id", "anonymous")
-    query = data.get("query", "")
-    entry = db.add_escalation(session_id, student_id, tag, query)
-    socketio.emit("escalation_added", entry, room=session_id)
-    socketio.emit("session_state", _session_snapshot(session_id), room=session_id)
-    return jsonify({"ok": True, "escalation": entry})
+@app.post("/api/sessions/{session_id}/escalation")
+async def api_add_escalation(session_id: str, body: EscalationBody):
+    entry = db.add_escalation(session_id, body.student_id, body.tag, body.query)
+    await _emit_to_session(session_id, "escalation_added", entry)
+    return {"ok": True, "escalation": entry}
 
 
-@app.route("/api/sessions/<session_id>/escalations", methods=["GET"])
-def api_get_escalations(session_id):
-    return jsonify(db.get_escalations(session_id))
+@app.get("/api/sessions/{session_id}/escalations")
+def api_get_escalations(session_id: str):
+    return db.get_escalations(session_id)
+
+
+# ──────────────────────────────────────────────
+# Recall.ai transcript ingestion (Issue #2 bridge)
+# ──────────────────────────────────────────────
+
+_rolling_transcripts: dict[str, list[str]] = {}
+
+@app.post("/api/recall/transcript")
+async def api_recall_transcript(body: RecallTranscriptBody):
+    session_id = body.session_id
+    speaker = body.speaker
+    text = body.text
+    is_final = body.is_final
+
+    if not text.strip():
+        return {"ok": True, "skipped": "empty"}
+
+    if session_id not in _rolling_transcripts:
+        s = db.get_session(session_id)
+        existing = s["transcript"] if s and s["transcript"] else ""
+        _rolling_transcripts[session_id] = [existing] if existing else []
+
+    if is_final:
+        line = f"{speaker}: {text}"
+        _rolling_transcripts[session_id].append(line)
+        full_transcript = "\n".join(_rolling_transcripts[session_id])
+        db.update_session_transcript(session_id, full_transcript)
+        await _emit_to_session(session_id, "transcript_updated", {"transcript": full_transcript})
+        print(f"[recall] {speaker}: {text}  (session {session_id})")
+    else:
+        current = "\n".join(_rolling_transcripts[session_id])
+        preview = f"{current}\n{speaker}: {text} ..."
+        await _emit_to_session(session_id, "transcript_updated", {"transcript": preview})
+
+    return {"ok": True}
 
 
 # ──────────────────────────────────────────────
 # Backward-compat: old single-session endpoints
-# (redirect to session-001 so existing frontend works)
 # ──────────────────────────────────────────────
 
-@app.route("/api/state", methods=["GET"])
+@app.get("/api/state")
 def api_state_compat():
     snap = _session_snapshot("session-001")
     if not snap:
-        return jsonify({"topic": "", "transcript": "", "escalations": [], "updated_at": _now_iso()})
-    return jsonify({
+        return {"topic": "", "transcript": "", "escalations": [], "updated_at": _now_iso()}
+    return {
         "topic": snap["topic"],
         "transcript": snap["transcript"],
         "escalations": snap["escalations"],
         "updated_at": snap["updated_at"],
-    })
+    }
 
 
-@app.route("/api/topic", methods=["POST"])
-def api_topic_compat():
-    data = request.get_json(force=True)
-    topic = data.get("topic", "")
-    db.update_session_topic("session-001", topic)
-    socketio.emit("topic_updated", {"topic": topic}, room="session-001")
-    socketio.emit("session_state", _session_snapshot("session-001"), room="session-001")
-    socketio.emit("topic_updated", {"topic": topic})
-    return jsonify({"ok": True, "topic": topic})
+@app.post("/api/topic")
+async def api_topic_compat(body: TopicBody):
+    db.update_session_topic("session-001", body.topic)
+    await _emit_to_session("session-001", "topic_updated", {"topic": body.topic})
+    return {"ok": True, "topic": body.topic}
 
 
-@app.route("/api/transcript", methods=["POST"])
-def api_transcript_compat():
-    data = request.get_json(force=True)
-    transcript = data.get("transcript", "")
-    db.update_session_transcript("session-001", transcript)
-    socketio.emit("transcript_updated", {"transcript": transcript}, room="session-001")
-    socketio.emit("session_state", _session_snapshot("session-001"), room="session-001")
-    socketio.emit("transcript_updated", {"transcript": transcript})
-    return jsonify({"ok": True})
+@app.post("/api/transcript")
+async def api_transcript_compat(body: TranscriptBody):
+    db.update_session_transcript("session-001", body.transcript)
+    await _emit_to_session("session-001", "transcript_updated", {"transcript": body.transcript})
+    return {"ok": True}
 
 
-@app.route("/api/escalation", methods=["POST"])
-def api_escalation_compat():
-    data = request.get_json(force=True)
-    tag = data.get("tag", "")
-    entry = db.add_escalation("session-001", "anonymous", tag)
-    socketio.emit("escalation_added", entry, room="session-001")
-    socketio.emit("escalation_added", entry)
-    return jsonify({"ok": True})
+@app.post("/api/escalation")
+async def api_escalation_compat(body: EscalationBody):
+    entry = db.add_escalation("session-001", "anonymous", body.tag)
+    await _emit_to_session("session-001", "escalation_added", entry)
+    return {"ok": True}
 
 
 # ──────────────────────────────────────────────
-# WebSocket events
+# WebSocket endpoint
+# Client connects to /ws/{session_id}
+# Receives JSON: { "event": "...", ...payload }
+# Can send JSON commands:
+#   { "action": "set_topic", "topic": "..." }
+#   { "action": "set_transcript", "transcript": "..." }
+#   { "action": "add_escalation", "tag": "...", "student_id": "...", "query": "..." }
+#   { "action": "request_state" }
 # ──────────────────────────────────────────────
 
-@socketio.on("connect")
-def handle_connect():
-    """Send a welcome; client should then emit join_session."""
-    print(f"[ws] client connected  – sid {request.sid}")
-    snap = _session_snapshot("session-001")
-    if snap:
-        emit("session_state", {
-            "topic": snap["topic"],
-            "transcript": snap["transcript"],
-            "escalations": snap["escalations"],
-            "updated_at": snap["updated_at"],
-        })
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await manager.connect(websocket, session_id)
+    print(f"[ws] client connected to room {session_id}")
 
-
-@socketio.on("disconnect")
-def handle_disconnect():
-    print(f"[ws] client disconnected – sid {request.sid}")
-
-
-@socketio.on("join_session")
-def handle_join_session(data):
-    """Client joins a session room. { session_id, user_id }"""
-    session_id = data.get("session_id", "")
-    user_id = data.get("user_id", "")
-    join_room(session_id)
+    # Send initial state
     snap = _session_snapshot(session_id)
     if snap:
-        emit("session_state", snap)
-    print(f"[ws] {user_id} joined room {session_id}")
+        await websocket.send_text(json.dumps({"event": "session_state", **snap}))
 
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
 
-@socketio.on("leave_session")
-def handle_leave_session(data):
-    session_id = data.get("session_id", "")
-    leave_room(session_id)
-    print(f"[ws] client left room {session_id}")
+            action = data.get("action", "")
 
+            if action == "set_topic":
+                topic = data.get("topic", "")
+                db.update_session_topic(session_id, topic)
+                await _emit_to_session(session_id, "topic_updated", {"topic": topic})
+                print(f"[ws] topic → {topic!r}  (session {session_id})")
 
-@socketio.on("request_state")
-def handle_request_state(data=None):
-    session_id = (data or {}).get("session_id", "session-001")
-    snap = _session_snapshot(session_id)
-    if snap:
-        emit("session_state", snap)
+            elif action == "set_transcript":
+                transcript = data.get("transcript", "")
+                db.update_session_transcript(session_id, transcript)
+                await _emit_to_session(session_id, "transcript_updated", {"transcript": transcript})
 
+            elif action == "add_escalation":
+                tag = data.get("tag", "")
+                student_id = data.get("student_id", "anonymous")
+                query = data.get("query", "")
+                entry = db.add_escalation(session_id, student_id, tag, query)
+                await _emit_to_session(session_id, "escalation_added", entry)
+                print(f"[ws] escalation → {tag!r}  (session {session_id})")
 
-@socketio.on("set_topic")
-def handle_set_topic(data):
-    session_id = data.get("session_id", "session-001")
-    topic = data.get("topic", "")
-    db.update_session_topic(session_id, topic)
-    socketio.emit("topic_updated", {"topic": topic}, room=session_id)
-    socketio.emit("session_state", _session_snapshot(session_id), room=session_id)
-    if session_id == "session-001":
-        socketio.emit("topic_updated", {"topic": topic})
-    print(f"[ws] topic → {topic!r}  (session {session_id})")
+            elif action == "request_state":
+                snap = _session_snapshot(session_id)
+                if snap:
+                    await websocket.send_text(json.dumps({"event": "session_state", **snap}))
 
-
-@socketio.on("set_transcript")
-def handle_set_transcript(data):
-    session_id = data.get("session_id", "session-001")
-    transcript = data.get("transcript", "")
-    db.update_session_transcript(session_id, transcript)
-    socketio.emit("transcript_updated", {"transcript": transcript}, room=session_id)
-    socketio.emit("session_state", _session_snapshot(session_id), room=session_id)
-    if session_id == "session-001":
-        socketio.emit("transcript_updated", {"transcript": transcript})
-
-
-@socketio.on("add_escalation")
-def handle_add_escalation(data):
-    session_id = data.get("session_id", "session-001")
-    student_id = data.get("student_id", "anonymous")
-    tag = data.get("tag", "")
-    query = data.get("query", "")
-    entry = db.add_escalation(session_id, student_id, tag, query)
-    socketio.emit("escalation_added", entry, room=session_id)
-    socketio.emit("session_state", _session_snapshot(session_id), room=session_id)
-    if session_id == "session-001":
-        socketio.emit("escalation_added", entry)
-    print(f"[ws] escalation → {tag!r}  (session {session_id})")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, session_id)
+        print(f"[ws] client disconnected from room {session_id}")
 
 
 # ──────────────────────────────────────────────
@@ -285,9 +350,10 @@ def handle_add_escalation(data):
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 5001))
     print(f"🚀  QnAI session server starting on :{port}")
     print(f"📦  Database at {db.DB_PATH}")
     print(f"👥  Users: {len(db.list_users())}")
     print(f"📚  Sessions: {len(db.list_sessions())}")
-    socketio.run(app, host="0.0.0.0", port=port, debug=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)
