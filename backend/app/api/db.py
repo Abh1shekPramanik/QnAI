@@ -62,7 +62,27 @@ CREATE TABLE IF NOT EXISTS escalations (
     session_id  TEXT NOT NULL REFERENCES sessions(id),
     student_id  TEXT NOT NULL REFERENCES users(id),
     tag         TEXT NOT NULL,
+    category    TEXT NOT NULL DEFAULT '',
     query       TEXT NOT NULL DEFAULT '',
+    addressed   INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_context (
+    session_id      TEXT PRIMARY KEY REFERENCES sessions(id),
+    current_subtopic TEXT NOT NULL DEFAULT 'unknown',
+    key_terms       TEXT NOT NULL DEFAULT '[]',
+    examples        TEXT NOT NULL DEFAULT '[]',
+    raw_buffer      TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pending_queries (
+    query_id    TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES sessions(id),
+    student_id  TEXT NOT NULL DEFAULT 'anonymous',
+    query       TEXT NOT NULL,
+    ai_answer   TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL
 );
 """
@@ -77,6 +97,16 @@ def init_db():
         conn.execute("ALTER TABLE sessions ADD COLUMN zoom_url TEXT")
     except sqlite3.OperationalError:
         pass # Already exists
+
+    try:
+        conn.execute("ALTER TABLE escalations ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE escalations ADD COLUMN addressed INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
         
     conn.commit()
     conn.close()
@@ -225,6 +255,122 @@ def get_escalations(session_id: str) -> list[dict]:
     rows = conn.execute("SELECT * FROM escalations WHERE session_id = ? ORDER BY created_at DESC", (session_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# ──────────────────────────────────────────────
+# Session context helpers
+# ──────────────────────────────────────────────
+
+def save_context(session_id: str, context: dict, raw_buffer: str = ""):
+    import json
+    conn = get_conn()
+    now = _now_iso()
+    conn.execute(
+        "INSERT INTO session_context (session_id, current_subtopic, key_terms, examples, raw_buffer, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(session_id) DO UPDATE SET "
+        "current_subtopic=excluded.current_subtopic, key_terms=excluded.key_terms, "
+        "examples=excluded.examples, raw_buffer=excluded.raw_buffer, updated_at=excluded.updated_at",
+        (session_id,
+         context.get("current_subtopic", "unknown"),
+         json.dumps(context.get("key_terms", [])),
+         json.dumps(context.get("examples", [])),
+         raw_buffer,
+         now),
+    )
+    conn.commit()
+    conn.close()
+
+def get_context(session_id: str) -> dict | None:
+    import json
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM session_context WHERE session_id = ?", (session_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    d["key_terms"] = json.loads(d["key_terms"])
+    d["examples"] = json.loads(d["examples"])
+    return d
+
+# ──────────────────────────────────────────────
+# Pending query helpers (Layer 1 → Layer 2)
+# ──────────────────────────────────────────────
+
+def save_pending_query(query_id: str, session_id: str, student_id: str, query: str, ai_answer: str) -> dict:
+    conn = get_conn()
+    now = _now_iso()
+    conn.execute(
+        "INSERT INTO pending_queries (query_id, session_id, student_id, query, ai_answer, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (query_id, session_id, student_id, query, ai_answer, now),
+    )
+    conn.commit()
+    conn.close()
+    return {"query_id": query_id, "session_id": session_id, "student_id": student_id,
+            "query": query, "ai_answer": ai_answer, "created_at": now}
+
+def get_pending_query(query_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM pending_queries WHERE query_id = ?", (query_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+# ──────────────────────────────────────────────
+# Escalation helpers (with category + addressed)
+# ──────────────────────────────────────────────
+
+def add_escalation_with_category(session_id: str, student_id: str, tag: str, category: str, query: str = "") -> dict:
+    conn = get_conn()
+    now = _now_iso()
+    if not get_user(student_id):
+        conn.execute("INSERT OR IGNORE INTO users (id, name, role, created_at) VALUES (?, ?, ?, ?)",
+                    (student_id, student_id, 'student', now))
+    cursor = conn.execute(
+        "INSERT INTO escalations (session_id, student_id, tag, category, query, addressed, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 0, ?)",
+        (session_id, student_id, tag, category, query, now),
+    )
+    esc_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return {"id": esc_id, "session_id": session_id, "student_id": student_id,
+            "tag": tag, "category": category, "query": query, "addressed": False, "created_at": now}
+
+def get_escalations_grouped(session_id: str) -> list[dict]:
+    """Returns escalations grouped by category for the teacher dashboard."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT category, COUNT(*) as count, "
+        "GROUP_CONCAT(id) as tag_ids, GROUP_CONCAT(tag, '||') as tags "
+        "FROM escalations WHERE session_id = ? AND addressed = 0 "
+        "GROUP BY category ORDER BY count DESC",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+
+    groups = []
+    for r in rows:
+        d = dict(r)
+        d["tag_ids"] = d["tag_ids"].split(",") if d["tag_ids"] else []
+        d["tags"] = d["tags"].split("||") if d["tags"] else []
+        groups.append(d)
+    return groups
+
+def mark_escalations_addressed(tag_ids: list[int]):
+    conn = get_conn()
+    placeholders = ",".join("?" * len(tag_ids))
+    conn.execute(f"UPDATE escalations SET addressed = 1 WHERE id IN ({placeholders})", tag_ids)
+    conn.commit()
+    conn.close()
+
+def get_existing_categories(session_id: str) -> list[str]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT category FROM escalations WHERE session_id = ? AND category != ''",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+    return [r["category"] for r in rows]
 
 # Auto-init
 init_db()

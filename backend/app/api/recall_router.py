@@ -4,6 +4,7 @@ import httpx
 from typing import List
 from fastapi import APIRouter, Request, HTTPException, WebSocket, WebSocketDisconnect
 from . import db
+from ..services import context_service
 
 router = APIRouter(prefix="/api/recall", tags=["recall"])
 
@@ -68,6 +69,10 @@ async def join_meeting(meeting_url: str, session_id: str = "session-001"):
             
         bot_data = response.json()
         db.update_session_bot_id(session_id, bot_data["id"], meeting_url)
+
+        # Start the 60s context extraction loop for this session
+        context_service.start_extraction(session_id)
+
         return {"session_id": session_id, "bot_id": bot_data["id"]}
 
 @router.post("/webhook")
