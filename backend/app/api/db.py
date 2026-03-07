@@ -1,35 +1,19 @@
-"""
-db.py — SQLite database for QnAI multi-user sessions.
-
-Tables
-──────
-  users        → professors and students
-  sessions     → lecture sessions (one per class / meeting)
-  session_members → which users are in which session
-  escalations  → confusion tags submitted by students
-
-On first import, creates the DB and seeds dummy data.
-"""
-
 import sqlite3
 import os
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "qnai.db")
-
+# DB_PATH relative to the root 'backend' folder
+DB_PATH = os.path.join(os.getcwd(), "qnai.db")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 def get_conn() -> sqlite3.Connection:
-    """Return a connection with row_factory set to dict."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
-
 
 # ──────────────────────────────────────────────
 # Schema
@@ -50,9 +34,20 @@ CREATE TABLE IF NOT EXISTS sessions (
     topic       TEXT NOT NULL DEFAULT '',
     transcript  TEXT NOT NULL DEFAULT '',
     professor_id TEXT NOT NULL REFERENCES users(id),
+    bot_id      TEXT UNIQUE,
+    zoom_url    TEXT,
     is_active   INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL REFERENCES sessions(id),
+    speaker     TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    is_final    INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS session_members (
@@ -72,109 +67,49 @@ CREATE TABLE IF NOT EXISTS escalations (
 );
 """
 
-
 def init_db():
-    """Create tables if they don't exist."""
     conn = get_conn()
     conn.executescript(SCHEMA)
+    
+    # Check for missing columns (in case DB already exists)
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN bot_id TEXT UNIQUE")
+        conn.execute("ALTER TABLE sessions ADD COLUMN zoom_url TEXT")
+    except sqlite3.OperationalError:
+        pass # Already exists
+        
     conn.commit()
     conn.close()
-
 
 # ──────────────────────────────────────────────
 # Seed dummy data
 # ──────────────────────────────────────────────
 
 DUMMY_USERS = [
-    ("prof-001",  "Example",      "professor", "example1@university.edu"),
-    ("prof-002",  "Example2", "professor", "example2@university.edu"),
-    ("stu-001",   "Alice Johnson",        "student",   "alice.j@university.edu"),
-    ("stu-002",   "Bob Kim",              "student",   "bob.k@university.edu"),
-    ("stu-003",   "Charlie Patel",        "student",   "charlie.p@university.edu"),
-    ("stu-004",   "Diana Lopez",          "student",   "diana.l@university.edu"),
-    ("stu-005",   "Ethan Brown",          "student",   "ethan.b@university.edu"),
-    ("stu-006",   "Fiona Davis",          "student",   "fiona.d@university.edu"),
-    ("stu-007",   "George Wilson",        "student",   "george.w@university.edu"),
-    ("stu-008",   "Hannah Lee",           "student",   "hannah.l@university.edu"),
+    ("prof-001",  "Professor",      "professor", "example1@university.edu"),
+    ("stu-001",   "Alice Student",  "student",   "alice@university.edu"),
 ]
-
-DUMMY_SESSIONS = [
-    ("session-001", "CS 101 — Intro to Algorithms", "Big-O Notation",     "prof-001"),
-    ("session-002", "CS 201 — Data Structures",     "Binary Search Trees", "prof-001"),
-    ("session-003", "MATH 301 — Linear Algebra",    "Eigenvalues",         "prof-002"),
-]
-
-# Which students are in which session
-DUMMY_MEMBERS = [
-    # Session 1: 5 students
-    ("session-001", "prof-001"),
-    ("session-001", "stu-001"),
-    ("session-001", "stu-002"),
-    ("session-001", "stu-003"),
-    ("session-001", "stu-004"),
-    ("session-001", "stu-005"),
-    # Session 2: 4 students
-    ("session-002", "prof-001"),
-    ("session-002", "stu-003"),
-    ("session-002", "stu-004"),
-    ("session-002", "stu-006"),
-    ("session-002", "stu-007"),
-    # Session 3: 3 students
-    ("session-003", "prof-002"),
-    ("session-003", "stu-005"),
-    ("session-003", "stu-006"),
-    ("session-003", "stu-008"),
-]
-
-DUMMY_ESCALATIONS = [
-    ("session-001", "stu-002", "Big-O confused",     "Why is O(n log n) faster than O(n²)?"),
-    ("session-001", "stu-004", "recursion unclear",   "How does recursion relate to Big-O?"),
-    ("session-003", "stu-008", "eigenvalue meaning",  "What does an eigenvalue represent geometrically?"),
-]
-
 
 def seed_db():
-    """Insert dummy data if tables are empty."""
     conn = get_conn()
     cursor = conn.cursor()
-
-    # Only seed if users table is empty
     count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     if count > 0:
         conn.close()
         return
 
     now = _now_iso()
-
-    # Users
     cursor.executemany(
         "INSERT INTO users (id, name, role, email, created_at) VALUES (?, ?, ?, ?, ?)",
         [(uid, name, role, email, now) for uid, name, role, email in DUMMY_USERS],
     )
-
-    # Sessions
-    cursor.executemany(
+    cursor.execute(
         "INSERT INTO sessions (id, title, topic, transcript, professor_id, created_at, updated_at) "
         "VALUES (?, ?, ?, '', ?, ?, ?)",
-        [(sid, title, topic, pid, now, now) for sid, title, topic, pid in DUMMY_SESSIONS],
+        ("session-001", "Main Lecture", "General", "prof-001", now, now)
     )
-
-    # Members
-    cursor.executemany(
-        "INSERT INTO session_members (session_id, user_id, joined_at) VALUES (?, ?, ?)",
-        [(sid, uid, now) for sid, uid in DUMMY_MEMBERS],
-    )
-
-    # Escalations
-    cursor.executemany(
-        "INSERT INTO escalations (session_id, student_id, tag, query, created_at) VALUES (?, ?, ?, ?, ?)",
-        [(sid, stid, tag, q, now) for sid, stid, tag, q in DUMMY_ESCALATIONS],
-    )
-
     conn.commit()
     conn.close()
-    print("🌱  Database seeded with dummy data")
-
 
 # ──────────────────────────────────────────────
 # Query helpers
@@ -186,23 +121,22 @@ def get_user(user_id: str) -> dict | None:
     conn.close()
     return dict(row) if row else None
 
-
 def list_users(role: str = None) -> list[dict]:
     conn = get_conn()
+    sql = "SELECT * FROM users"
+    params = []
     if role:
-        rows = conn.execute("SELECT * FROM users WHERE role = ?", (role,)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM users").fetchall()
+        sql += " WHERE role = ?"
+        params.append(role)
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
 
 def get_session(session_id: str) -> dict | None:
     conn = get_conn()
     row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
-
 
 def list_sessions(professor_id: str = None, active_only: bool = True) -> list[dict]:
     conn = get_conn()
@@ -217,31 +151,6 @@ def list_sessions(professor_id: str = None, active_only: bool = True) -> list[di
     conn.close()
     return [dict(r) for r in rows]
 
-
-def get_session_members(session_id: str) -> list[dict]:
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT u.* FROM users u "
-        "JOIN session_members sm ON u.id = sm.user_id "
-        "WHERE sm.session_id = ?",
-        (session_id,),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def get_student_sessions(student_id: str) -> list[dict]:
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT s.* FROM sessions s "
-        "JOIN session_members sm ON s.id = sm.session_id "
-        "WHERE sm.user_id = ? AND s.is_active = 1",
-        (student_id,),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
 def update_session_topic(session_id: str, topic: str):
     conn = get_conn()
     conn.execute(
@@ -251,44 +160,72 @@ def update_session_topic(session_id: str, topic: str):
     conn.commit()
     conn.close()
 
-
-def update_session_transcript(session_id: str, transcript: str):
+def update_session_bot_id(session_id: str, bot_id: str, zoom_url: str):
     conn = get_conn()
     conn.execute(
-        "UPDATE sessions SET transcript = ?, updated_at = ? WHERE id = ?",
-        (transcript, _now_iso(), session_id),
+        "UPDATE sessions SET bot_id = ?, zoom_url = ?, updated_at = ? WHERE id = ?",
+        (bot_id, zoom_url, _now_iso(), session_id),
     )
     conn.commit()
     conn.close()
 
-
-def add_escalation(session_id: str, student_id: str, tag: str, query: str = "") -> dict:
+def get_session_by_bot_id(bot_id: str) -> dict | None:
     conn = get_conn()
-    now = _now_iso()
-    cursor = conn.execute(
-        "INSERT INTO escalations (session_id, student_id, tag, query, created_at) "
+    row = conn.execute("SELECT * FROM sessions WHERE bot_id = ?", (bot_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def save_transcript(session_id: str, speaker: str, text: str, is_final: bool = True):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO transcripts (session_id, speaker, text, is_final, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (session_id, student_id, tag, query, now),
+        (session_id, speaker, text, 1 if is_final else 0, _now_iso()),
     )
-    esc_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    return {"id": esc_id, "session_id": session_id, "student_id": student_id,
-            "tag": tag, "query": query, "created_at": now}
 
-
-def get_escalations(session_id: str) -> list[dict]:
+def get_transcripts(session_id: str) -> list[dict]:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM escalations WHERE session_id = ? ORDER BY created_at DESC",
+        "SELECT * FROM transcripts WHERE session_id = ? ORDER BY created_at ASC",
         (session_id,),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
+def get_session_members(session_id: str) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT u.* FROM users u JOIN session_members sm ON u.id = sm.user_id WHERE sm.session_id = ?",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
-# ──────────────────────────────────────────────
-# Auto-init on import
-# ──────────────────────────────────────────────
+def add_escalation(session_id: str, student_id: str, tag: str, query: str = "") -> dict:
+    conn = get_conn()
+    now = _now_iso()
+    # Check if student exists, if not, create mock
+    if not get_user(student_id):
+        conn.execute("INSERT OR IGNORE INTO users (id, name, role, created_at) VALUES (?, ?, ?, ?)", 
+                    (student_id, student_id, 'student', now))
+    
+    cursor = conn.execute(
+        "INSERT INTO escalations (session_id, student_id, tag, query, created_at) VALUES (?, ?, ?, ?, ?)",
+        (session_id, student_id, tag, query, now),
+    )
+    esc_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return {"id": esc_id, "session_id": session_id, "student_id": student_id, "tag": tag, "query": query, "created_at": now}
+
+def get_escalations(session_id: str) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute("SELECT * FROM escalations WHERE session_id = ? ORDER BY created_at DESC", (session_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# Auto-init
 init_db()
 seed_db()
