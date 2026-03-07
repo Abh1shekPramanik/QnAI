@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 venv/
 .venv
+
+backend/.DS_Store
+backend/service-account.json
