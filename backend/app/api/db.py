@@ -50,9 +50,20 @@ CREATE TABLE IF NOT EXISTS sessions (
     topic       TEXT NOT NULL DEFAULT '',
     transcript  TEXT NOT NULL DEFAULT '',
     professor_id TEXT NOT NULL REFERENCES users(id),
+    bot_id      TEXT UNIQUE,
+    zoom_url    TEXT,
     is_active   INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL REFERENCES sessions(id),
+    speaker     TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    is_final    INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS session_members (
@@ -252,11 +263,39 @@ def update_session_topic(session_id: str, topic: str):
     conn.close()
 
 
-def update_session_transcript(session_id: str, transcript: str):
+def get_session_by_bot_id(bot_id: str) -> dict | None:
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM sessions WHERE bot_id = ?", (bot_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_transcript(session_id: str, speaker: str, text: str, is_final: bool = True):
     conn = get_conn()
     conn.execute(
-        "UPDATE sessions SET transcript = ?, updated_at = ? WHERE id = ?",
-        (transcript, _now_iso(), session_id),
+        "INSERT INTO transcripts (session_id, speaker, text, is_final, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (session_id, speaker, text, 1 if is_final else 0, _now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_transcripts(session_id: str) -> list[dict]:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM transcripts WHERE session_id = ? ORDER BY created_at ASC",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_session_bot_id(session_id: str, bot_id: str, zoom_url: str):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE sessions SET bot_id = ?, zoom_url = ?, updated_at = ? WHERE id = ?",
+        (bot_id, zoom_url, _now_iso(), session_id),
     )
     conn.commit()
     conn.close()
