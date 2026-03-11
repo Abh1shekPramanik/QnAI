@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import axios from "axios";
-import { Send, MessageCircle, Mic, AlertCircle, HelpCircle } from "lucide-react";
+import { Send, MessageCircle, AlertCircle, HelpCircle, Sparkles } from "lucide-react";
+import TranscriptWindow from "./TranscriptWindow";
 
 const BACKEND_URL = "https://0416-131-239-113-82.ngrok-free.app";
 
@@ -9,7 +10,8 @@ export default function StudentDashboard() {
   const [userName, setUserName] = useState("");
   const [userId, setUserId] = useState(null);
   const [question, setQuestion] = useState("");
-  const [transcripts, setTranscripts] = useState([]);
+  const [incomingTranscript, setIncomingTranscript] = useState(null);
+  const [aiAnswers, setAiAnswers] = useState([]);
   const [isJoined, setIsJoined] = useState(false);
   const ws = useRef(null);
 
@@ -21,7 +23,9 @@ export default function StudentDashboard() {
     ws.current.onmessage = (event) => {
       const data = JSON.parse(event.data);
       if (data.type === "transcript") {
-        setTranscripts(prev => [data, ...prev].slice(0, 100));
+        setIncomingTranscript(data);
+      } else if (data.type === "ai_answer") {
+        setAiAnswers(prev => [data, ...prev]);
       }
     };
 
@@ -38,8 +42,7 @@ export default function StudentDashboard() {
       setUserId(res.data.id);
       setIsJoined(true);
     } catch (err) {
-      console.error(err);
-      alert("Error joining session. Ensure backend is running and session exists.");
+      alert("Error joining session.");
     }
   };
 
@@ -51,9 +54,9 @@ export default function StudentDashboard() {
         query: question
       });
       setQuestion("");
+      alert("Sent!");
     } catch (err) {
-      console.error(err);
-      alert("Failed to send question.");
+      alert("Failed to send.");
     }
   };
 
@@ -62,9 +65,9 @@ export default function StudentDashboard() {
       await axios.post(`${BACKEND_URL}/api/sessions/${sessionId}/escalation`, {
         student_id: userName,
         tag: tag,
-        query: `The student marked this as ${tag}`
+        query: "Student flagged"
       });
-      alert(`Flagged as: ${tag}`);
+      alert(`Professor notified: ${tag}`);
     } catch (err) {
       console.error(err);
     }
@@ -73,36 +76,40 @@ export default function StudentDashboard() {
   return (
     <div className="container">
       <div className="header">
-        <h1>Student Dashboard</h1>
+        <h1>Student Portal</h1>
         {isJoined && <span className="status-badge">● CONNECTED</span>}
       </div>
 
       {!isJoined ? (
-        <div className="card">
-          <h3>Join the Class</h3>
-          <input className="input" placeholder="Your Name" value={userName} onChange={e => setUserName(e.target.value)} />
-          <button className="btn" onClick={joinSession}>Join Session</button>
+        <div className="card" style={{maxWidth: "500px", margin: "0 auto"}}>
+          <h3>Join Lecture</h3>
+          <input className="input" placeholder="Your Full Name" value={userName} onChange={e => setUserName(e.target.value)} />
+          <button className="btn" style={{width: "100%"}} onClick={joinSession}>Enter</button>
         </div>
       ) : (
         <div style={{display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: "2rem"}}>
-          <div className="card">
-            <h3><Mic size={18} /> Real-time Transcription</h3>
-            <div className="transcript-area">
-              {transcripts.map((t, i) => (
-                <div key={i} className="transcript-item" style={{opacity: t.is_final ? 1 : 0.6}}>
-                  <span className="speaker">{t.speaker}:</span> {t.text}
-                </div>
-              ))}
+          <div>
+            <TranscriptWindow incomingTranscript={incomingTranscript} sessionId={sessionId} />
+            <div className="card" style={{marginTop: "1rem", border: "1px solid #7c3aed"}}>
+              <h3 style={{color: "#7c3aed"}}><Sparkles size={18} /> AI Answers</h3>
+              <div style={{maxHeight: "200px", overflowY: "auto"}}>
+                {aiAnswers.length === 0 ? <p style={{fontSize: "0.9rem", color: "#94a3b8"}}>Your answers will appear here.</p> : 
+                  aiAnswers.map((ans, i) => (
+                    <div key={i} style={{padding: "0.75rem", background: "#f5f3ff", borderRadius: "6px", marginBottom: "0.5rem", fontSize: "0.9rem"}}>
+                      {ans.answer}
+                    </div>
+                  ))
+                }
+              </div>
             </div>
           </div>
 
           <div style={{display: "flex", flexDirection: "column", gap: "1rem"}}>
-            <div className="card" style={{border: "2px solid #fee2e2"}}>
-              <h3 style={{color: "#dc2626"}}><AlertCircle size={18} /> I'm Confused</h3>
-              <p style={{fontSize: "0.85rem", marginBottom: "1rem"}}>Click a tag below to anonymously notify the professor that the current topic is unclear.</p>
+            <div className="card" style={{background: "#fef2f2"}}>
+              <h3 style={{color: "#991b1b"}}><AlertCircle size={18} /> Confusion</h3>
               <div style={{display: "flex", flexWrap: "wrap", gap: "0.5rem"}}>
-                {["Too Fast", "Unclear Concept", "Need Example", "Explain Again"].map(tag => (
-                  <button key={tag} className="btn btn-secondary" onClick={() => sendEscalation(tag)} style={{fontSize: "0.8rem"}}>
+                {["Too Fast", "Need Example", "Explain Again"].map(tag => (
+                  <button key={tag} className="btn btn-secondary" style={{fontSize: "0.75rem", color: "#991b1b", background: "#fff"}} onClick={() => sendEscalation(tag)}>
                     {tag}
                   </button>
                 ))}
@@ -110,17 +117,9 @@ export default function StudentDashboard() {
             </div>
 
             <div className="card">
-              <h3><HelpCircle size={18} /> Ask a Question</h3>
-              <textarea 
-                className="input" 
-                style={{height: "80px"}} 
-                placeholder="Type your question..." 
-                value={question} 
-                onChange={e => setQuestion(e.target.value)}
-              />
-              <button className="btn" onClick={askQuestion}>
-                <Send size={18} style={{marginRight: 8}} /> Send
-              </button>
+              <h3><MessageCircle size={18} /> Ask Question</h3>
+              <textarea className="input" style={{height: "80px"}} placeholder="Ask anything..." value={question} onChange={e => setQuestion(e.target.value)} />
+              <button className="btn" onClick={askQuestion}><Send size={16} /> Send</button>
             </div>
           </div>
         </div>

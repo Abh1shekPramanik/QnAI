@@ -3,12 +3,9 @@ import google.generativeai as genai
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from . import db
+from .recall_router import manager
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 
 class AnswerRequest(BaseModel):
     session_id: str
@@ -16,55 +13,32 @@ class AnswerRequest(BaseModel):
 
 @router.post("/answer")
 async def answer_question(req: AnswerRequest):
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="Gemini API Key not configured")
-
-    # 1. Get the question
-    # Note: We need a get_question helper in db.py. 
-    # For now, let's assume we fetch it.
+    # HARDCODED TEST RESPONSE
+    mock_answer = "A Binary Search Tree (BST) is a tree-like data structure where each node has at most two children. For any given node, all elements in the left subtree are smaller, and all elements in the right subtree are larger. This allows for very fast searching, insertion, and deletion."
+    
     conn = db.get_conn()
-    q_row = conn.execute("SELECT * FROM escalations WHERE id = ?", (req.question_id,)).fetchone()
-    if not q_row:
-        # Check the 'questions' table if you added one earlier, 
-        # or reuse escalations as the source.
-        q_row = conn.execute("SELECT * FROM escalations WHERE id = ?", (req.question_id,)).fetchone()
-    
-    if not q_row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Question not found")
-    
-    question_text = q_row["query"] or q_row["tag"]
-    
-    # 2. Get recent transcripts for context
-    transcripts = db.get_transcripts(req.session_id)
-    context = "\n".join([f"{t['speaker']}: {t['text']}" for t in transcripts[-20:]])
-    
-    # 3. Generate Answer
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    prompt = f"""
-    You are an AI assistant in a live university lecture. 
-    Based on the following recent transcript of the lecture, answer the student's question concisely.
-    
-    Lecture Context:
-    {context}
-    
-    Student Question:
-    {question_text}
-    
-    AI Answer:
-    """
-    
     try:
-        response = model.generate_content(prompt)
-        answer = response.text
-        
-        # 4. Save answer to DB (Update the escalation or question row)
+        # Check if question exists
+        q_row = conn.execute("SELECT * FROM escalations WHERE id = ?", (req.question_id,)).fetchone()
+        if not q_row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Question not found")
+
+        # Update DB
         conn.execute("UPDATE escalations SET query = ? WHERE id = ?", 
-                    (f"{question_text}\n\nAI Answer: {answer}", req.question_id))
+                    (f"{q_row['query']}\n\nAI Answer: {mock_answer}", req.question_id))
         conn.commit()
         conn.close()
+
+        # Broadcast to everyone via WebSocket
+        await manager.broadcast({
+            "type": "ai_answer",
+            "question_id": req.question_id,
+            "answer": mock_answer
+        })
         
-        return {"answer": answer}
+        return {"answer": mock_answer}
     except Exception as e:
-        conn.close()
+        if conn: conn.close()
+        print(f"❌ MOCK AI ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
